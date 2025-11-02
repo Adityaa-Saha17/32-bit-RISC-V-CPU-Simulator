@@ -7,10 +7,10 @@ vector<int32_t> regs(32, 0);
 vector<int32_t> memory(1024, 0);
 
 void execute() {
-    IF_ID if_id;
-    ID_EX id_ex;
-    EX_MEM ex_mem;
-    MEM_WB mem_wb;
+    IF_ID if_id;     // old IF/ID
+    ID_EX id_ex;     // old ID/EX
+    EX_MEM ex_mem;   // old EX/MEM
+    MEM_WB mem_wb;   // old MEM/WB
 
     int32_t PC = 0;
     bool finished = false;
@@ -20,12 +20,12 @@ void execute() {
         cycle++;
         cout << "\nCycle " << cycle << " ----------------\n";
 
-        // -------------------- WB stage --------------------
+        // -------------------- WB stage (use old mem_wb) --------------------
         if (!mem_wb.empty && mem_wb.regWrite && mem_wb.rd != 0) {
             regs[mem_wb.rd] = mem_wb.mem2reg ? mem_wb.memData : mem_wb.aluResult;
         }
 
-        // -------------------- MEM stage --------------------
+        // -------------------- MEM stage (produce new MEM/WB) ----------------
         MEM_WB new_mem_wb;
         new_mem_wb.empty = true;
         if (!ex_mem.empty) {
@@ -34,60 +34,42 @@ void execute() {
             new_mem_wb.mem2reg = ex_mem.mem2reg;
 
             if (ex_mem.memRead) {
+                // load: read from data memory
                 new_mem_wb.memData = memory[ex_mem.aluResult / 4];
             } else {
-                if (ex_mem.memWrite) {
-                    memory[ex_mem.aluResult / 4] = ex_mem.regData2;
-                }
                 new_mem_wb.memData = 0;
             }
 
+            // pass ALU result along
             new_mem_wb.aluResult = ex_mem.aluResult;
             new_mem_wb.empty = false;
-
-            // --- Handle branch/jump flush only when taken ---
-            if (ex_mem.branchTaken) {
-                PC = ex_mem.branchTarget;
-                if_id.empty = true; // Flush next fetched instruction
-                id_ex.empty = true; // Flush decode stage
-            }
         }
 
-        // -------------------- EX stage --------------------
+        // -------------------- EX stage (use id_ex, ex_mem, mem_wb old) ----------------
         EX_MEM new_ex_mem;
         new_ex_mem.empty = true;
         if (!id_ex.empty) {
+            // Determine ALU operands with forwarding
             int32_t op1 = id_ex.regData1;
             int32_t op2 = id_ex.ALUSrc ? id_ex.imm : id_ex.regData2;
 
-            // --- Forwarding for rs1 ---
-            if (!ex_mem.empty && ex_mem.regWrite && ex_mem.rd != 0 && ex_mem.rd == id_ex.rs1 && !ex_mem.memRead)
+            // Forwarding from EX/MEM (priority) if EX/MEM writes and is not a load
+            if (!ex_mem.empty && ex_mem.regWrite && ex_mem.rd != 0 && ex_mem.rd == id_ex.rs1 && !ex_mem.memRead) {
                 op1 = ex_mem.aluResult;
-            else if (!mem_wb.empty && mem_wb.regWrite && mem_wb.rd != 0 && mem_wb.rd == id_ex.rs1)
+            } else if (!mem_wb.empty && mem_wb.regWrite && mem_wb.rd != 0 && mem_wb.rd == id_ex.rs1) {
                 op1 = mem_wb.mem2reg ? mem_wb.memData : mem_wb.aluResult;
+            }
 
-            // --- Forwarding for rs2 ---
-            if (!id_ex.ALUSrc) {
-                if (!ex_mem.empty && ex_mem.regWrite && ex_mem.rd != 0 && ex_mem.rd == id_ex.rs2 && !ex_mem.memRead)
+            if (!id_ex.ALUSrc) { // only consider rs2 forwarding when second operand is register
+                if (!ex_mem.empty && ex_mem.regWrite && ex_mem.rd != 0 && ex_mem.rd == id_ex.rs2 && !ex_mem.memRead) {
                     op2 = ex_mem.aluResult;
-                else if (!mem_wb.empty && mem_wb.regWrite && mem_wb.rd != 0 && mem_wb.rd == id_ex.rs2)
+                } else if (!mem_wb.empty && mem_wb.regWrite && mem_wb.rd != 0 && mem_wb.rd == id_ex.rs2) {
                     op2 = mem_wb.mem2reg ? mem_wb.memData : mem_wb.aluResult;
+                }
             }
 
+            // Now call ALU with forwarded operands
             int32_t result = alu(op1, op2, id_ex.opcode, id_ex.func7, id_ex.func3);
-
-            // --- Branch / Jump handling ---
-            bool branchTaken = false;
-            int32_t branchTarget = id_ex.PC + id_ex.imm;
-
-            if (id_ex.opcode == "1100011") { // BEQ
-                if (id_ex.func3 == 0b000 && op1 == op2)
-                    branchTaken = true;
-            } 
-            else if (id_ex.opcode == "1101111") { // JAL
-                branchTaken = true;
-                result = id_ex.PC + 4; // link value
-            }
 
             new_ex_mem.aluResult = result;
             new_ex_mem.regData2 = id_ex.regData2;
@@ -97,30 +79,23 @@ void execute() {
             new_ex_mem.memWrite = id_ex.memWrite;
             new_ex_mem.mem2reg = id_ex.mem2reg;
             new_ex_mem.jump = id_ex.jump;
-            new_ex_mem.branchTaken = branchTaken;
-            new_ex_mem.branchTarget = branchTarget;
             new_ex_mem.empty = false;
         }
 
-        // -------------------- Hazard Detection --------------------
+        // -------------------- Hazard detection (LOAD-USE) --------------------
         bool stall = false;
-        IF_ID new_if_id = if_id;
-        ID_EX new_id_ex;
-        new_id_ex.empty = true;
-
-        // --- LOAD-USE Hazard Stall ---
+        // If there is a load in ID/EX (i.e., producing data in MEM) and IF/ID instruction reads its rd => stall
         if (!id_ex.empty && id_ex.memRead && !if_id.empty) {
-            string next = if_id.instr;
-            int next_rs1 = binToUInt(extractBits(next, 19, 15));
-            int next_rs2 = binToUInt(extractBits(next, 24, 20));
-            if (id_ex.rd == next_rs1 || id_ex.rd == next_rs2) {
+            int next_rs1 = binToUInt(extractBits(if_id.instr, 19, 15));
+            int next_rs2 = binToUInt(extractBits(if_id.instr, 24, 20));
+            if (id_ex.rd != 0 && (id_ex.rd == next_rs1 || id_ex.rd == next_rs2)) {
                 stall = true;
-                new_if_id = if_id;       // Hold IF/ID
-                new_id_ex.empty = true;  // Bubble
             }
         }
 
-        // -------------------- ID stage --------------------
+        // -------------------- ID stage (if not stalling) --------------------
+        ID_EX new_id_ex;
+        new_id_ex.empty = true;
         if (!stall && !if_id.empty) {
             string inst = if_id.instr;
             string opcode = extractBits(inst, 6, 0);
@@ -148,16 +123,22 @@ void execute() {
             new_id_ex.ALUSrc = sig.ALUSrc;
             new_id_ex.branch = sig.branch;
             new_id_ex.jump = sig.jump;
-            new_id_ex.imm = imm_i(inst); // ensure imm_i covers I/B/J types correctly
+            new_id_ex.imm = imm_i(inst);
             new_id_ex.empty = false;
+        } else if (stall) {
+            // Insert bubble in ID/EX (a NOP) by leaving new_id_ex.empty == true
         }
 
-        // -------------------- IF stage --------------------
+        // -------------------- IF stage (if not stalling) --------------------
+        IF_ID new_if_id;
+        new_if_id.empty = true;
         if (!stall && PC / 4 < (int)binCode.size()) {
             new_if_id.instr = binCode[PC / 4];
             new_if_id.PC = PC;
             new_if_id.empty = false;
             PC += 4;
+        } else if (stall) {
+            // hold IF/ID (we will assign if_id back later)
         }
 
         // -------------------- Debug (optional) --------------------
@@ -165,18 +146,20 @@ void execute() {
         for (int i = 0; i < 32; i++) cout << "x" << i << " = " << regs[i] << endl;
         cout << "\n";
 
-        // -------------------- Pipeline Register Update --------------------
+        // -------------------- Commit pipeline registers (one clock tick) --------------------
         mem_wb = new_mem_wb;
         ex_mem = new_ex_mem;
-
+        // if stall: hold IF/ID (i.e., don't move it forward), and set id_ex to bubble
         if (!stall) {
             id_ex = new_id_ex;
             if_id = new_if_id;
         } else {
-            id_ex.empty = true; // insert bubble
+            // freeze IF/ID (keep old if_id) and insert bubble at ID/EX
+            id_ex.empty = true;
+            // if_id remains unchanged
         }
 
-        // -------------------- Termination --------------------
+        // -------------------- Termination condition --------------------
         finished = if_id.empty && id_ex.empty && ex_mem.empty && mem_wb.empty && PC / 4 >= (int)binCode.size();
     }
 
