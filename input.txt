@@ -1,11 +1,7 @@
-addi x1, x0, 7
-addi x2, x0, 4
-addi x3, x0, 3
-addi x4, x0, 1
-addi x5, x0, 6
-
-add x6, x6, x1
-add x6, x6, x2
-add x6, x6, x3
-add x6, x6, x4
-add x6, x6, x5
+addi x1, x0, 6
+addi x2, x0, 1
+addi x3, x0, 6
+beq x3, x0, 16
+mul x2, x2, x3
+addi x3, x3, -1
+jal x0, -16
